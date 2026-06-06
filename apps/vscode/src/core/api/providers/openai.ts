@@ -6,6 +6,7 @@ import type { ChatCompletionReasoningEffort, ChatCompletionTool } from "openai/r
 import { buildExternalBasicHeaders } from "@/services/EnvUtils"
 import { ClineStorageMessage } from "@/shared/messages/content"
 import { createOpenAIClient, fetch } from "@/shared/net"
+import { Logger } from "@/shared/services/Logger"
 import { ApiHandler, CommonApiHandlerOptions } from "../index"
 import { withRetry } from "../retry"
 import { convertToOpenAiMessages } from "../transform/openai-format"
@@ -22,6 +23,7 @@ interface OpenAiHandlerOptions extends CommonApiHandlerOptions {
 	openAiModelId?: string
 	openAiModelInfo?: OpenAiCompatibleModelInfo
 	reasoningEffort?: string
+	requestTimeoutMs?: number
 }
 
 export class OpenAiHandler implements ApiHandler {
@@ -66,6 +68,7 @@ export class OpenAiHandler implements ApiHandler {
 								...this.options.openAiHeaders,
 							},
 							fetch,
+							timeout: this.options.requestTimeoutMs || 30000,
 						})
 					} else {
 						this.client = new AzureOpenAI({
@@ -77,6 +80,7 @@ export class OpenAiHandler implements ApiHandler {
 								...this.options.openAiHeaders,
 							},
 							fetch,
+							timeout: this.options.requestTimeoutMs || 30000,
 						})
 					}
 				} else {
@@ -84,6 +88,7 @@ export class OpenAiHandler implements ApiHandler {
 						baseURL: this.options.openAiBaseUrl,
 						apiKey: this.options.openAiApiKey,
 						defaultHeaders: this.options.openAiHeaders,
+						timeout: this.options.requestTimeoutMs || 30000,
 					})
 				}
 			} catch (error: any) {
@@ -133,49 +138,74 @@ export class OpenAiHandler implements ApiHandler {
 			reasoningEffort = requestedEffort === "none" ? undefined : (requestedEffort as ChatCompletionReasoningEffort)
 		}
 
-		const stream = await client.chat.completions.create({
-			model: modelId,
-			messages: openAiMessages,
-			temperature,
-			max_tokens: maxTokens,
-			reasoning_effort: reasoningEffort,
-			stream: true,
-			stream_options: { include_usage: true },
-			...getOpenAIToolParams(tools),
-		})
+		try {
+			// Create a promise that rejects after timeout
+			const timeoutMs = this.options.requestTimeoutMs || 30000
+			const timeoutPromise = new Promise<never>((_, reject) => {
+				setTimeout(() => reject(new Error(`OpenAI request timed out after ${timeoutMs / 1000} seconds`)), timeoutMs)
+			})
 
-		const toolCallProcessor = new ToolCallProcessor()
+			// Create the actual API request promise
+			const apiPromise = client.chat.completions.create({
+				model: modelId,
+				messages: openAiMessages,
+				temperature,
+				max_tokens: maxTokens,
+				reasoning_effort: reasoningEffort,
+				stream: true,
+				stream_options: { include_usage: true },
+				...getOpenAIToolParams(tools),
+			})
 
-		for await (const chunk of stream) {
-			const delta = chunk.choices?.[0]?.delta
-			if (delta?.content) {
-				yield {
-					type: "text",
-					text: delta.content,
+			const toolCallProcessor = new ToolCallProcessor()
+
+			// Race the API request against the timeout
+			const stream = (await Promise.race([apiPromise, timeoutPromise])) as Awaited<typeof apiPromise>
+
+			for await (const chunk of stream) {
+				const delta = chunk.choices?.[0]?.delta
+				if (delta?.content) {
+					yield {
+						type: "text",
+						text: delta.content,
+					}
+				}
+
+				if (delta && "reasoning_content" in delta && delta.reasoning_content) {
+					yield {
+						type: "reasoning",
+						reasoning: (delta.reasoning_content as string | undefined) || "",
+					}
+				}
+
+				if (delta?.tool_calls) {
+					yield* toolCallProcessor.processToolCallDeltas(delta.tool_calls)
+				}
+
+				if (chunk.usage) {
+					yield {
+						type: "usage",
+						inputTokens: chunk.usage.prompt_tokens || 0,
+						outputTokens: chunk.usage.completion_tokens || 0,
+						cacheReadTokens: chunk.usage.prompt_tokens_details?.cached_tokens || 0,
+						// @ts-expect-error-next-line
+						cacheWriteTokens: chunk.usage.prompt_cache_miss_tokens || 0,
+					}
 				}
 			}
-
-			if (delta && "reasoning_content" in delta && delta.reasoning_content) {
-				yield {
-					type: "reasoning",
-					reasoning: (delta.reasoning_content as string | undefined) || "",
-				}
+		} catch (error) {
+			// Check if it's a timeout error
+			if (error?.message?.includes("timed out")) {
+				const timeoutMs = this.options.requestTimeoutMs || 30000
+				throw new Error(`OpenAI request timed out after ${timeoutMs / 1000} seconds`)
 			}
 
-			if (delta?.tool_calls) {
-				yield* toolCallProcessor.processToolCallDeltas(delta.tool_calls)
-			}
+			// Enhance error reporting
+			const statusCode = error.status || error.statusCode
+			const errorMessage = error.message || "Unknown error"
 
-			if (chunk.usage) {
-				yield {
-					type: "usage",
-					inputTokens: chunk.usage.prompt_tokens || 0,
-					outputTokens: chunk.usage.completion_tokens || 0,
-					cacheReadTokens: chunk.usage.prompt_tokens_details?.cached_tokens || 0,
-					// @ts-expect-error-next-line
-					cacheWriteTokens: chunk.usage.prompt_cache_miss_tokens || 0,
-				}
-			}
+			Logger.error(`OpenAI API error (${statusCode || "unknown"}): ${errorMessage}`)
+			throw error
 		}
 	}
 
