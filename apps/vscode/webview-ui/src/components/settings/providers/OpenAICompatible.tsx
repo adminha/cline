@@ -405,6 +405,23 @@ export const OpenAICompatibleProvider = ({ showModelOptions, isPopup, currentMod
 
 			{showModelOptions && (
 				<>
+					<DebouncedTextField
+						initialValue={apiConfiguration?.requestTimeoutMs ? apiConfiguration.requestTimeoutMs.toString() : "30000"}
+						onChange={(value) => {
+							// Convert to number, with validation
+							const numValue = parseInt(value, 10)
+							if (!Number.isNaN(numValue) && numValue > 0) {
+								handleFieldChange("requestTimeoutMs", numValue)
+							}
+						}}
+						placeholder="Default: 30000 (30 seconds)"
+						style={{ width: "100%" }}>
+						<span style={{ fontWeight: 500 }}>Request Timeout (ms)</span>
+					</DebouncedTextField>
+					<p className="text-xs mt-0 text-description">
+						Maximum time in milliseconds to wait for API responses before timing out.
+					</p>
+
 					{showReasoningEffort && <ReasoningEffortSelector currentMode={currentMode} />}
 					<ModelInfoView isPopup={isPopup} modelInfo={selectedModelInfo} selectedModelId={selectedModelId} />
 				</>
